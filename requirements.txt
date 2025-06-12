@@ -1,0 +1,12 @@
+feedparser
+beautifulsoup4
+requests
+nltk
+tweepy
+facebook-sdk
+instaloader
+schedule
+pytz
+Pillow
+atproto
+regex
