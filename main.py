@@ -1,42 +1,44 @@
 # main.py
-import feedparser
-from bs4 import BeautifulSoup
-import requests
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
-import tweepy
-import facebook
-import instaloader
-import random
-import schedule
-import time
-import pytz
+import logging, random, schedule, time, pytz
 from datetime import datetime
-from PIL import Image
 from io import BytesIO
-from atproto import Client
-import regex
-import logging
-
 from news_sources_config import get_all_news_sources
-from usernames import x_credentials, facebook_credentials, instagram_credentials, bluesky_credentials
 
-nltk.download('vader_lexicon')
-sia = SentimentIntensityAnalyzer()
+from usernames          import (
+    x_credentials,
+    facebook_credentials,
+    instagram_credentials,
+    bluesky_credentials,
+)
+from utils import (
+    scrape_articles,
+    fetch_feed_with_retries,
+    extract_article_content,
+    filter_debate_driven,
+    generate_hashtags,
+    truncate_to_graphemes,
+    create_facets_from_text,
+    paginate,
+    is_valid_image_url,
+    FALLBACK_IMAGE_URL,
+)
+
+import tweepy, facebook, instaloader, requests
+from atproto import Client
 
 # Setup logging
 logging.basicConfig(
     filename='poster.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    filemode='w'  # Overwrite log file on each run
+    filemode='w',
 )
-
 logging.info("Script started")
 
 # Load news sources
 news_sources = get_all_news_sources(include_uk=True, include_other_english=True)
 logging.info(f"Loaded {len(news_sources)} news sources")
+
 
 captions = [
     "What's your take on this?\n",
@@ -52,111 +54,6 @@ captions = [
     "What's on your mind?\n"
 ]
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0)'}
-
-FALLBACK_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/768px-No_image_available.svg.png"
-
-def fetch_feed(url, timeout=15):
-    try:
-        logging.info(f"Fetching RSS feed: {url}")
-        response = requests.get(url, timeout=timeout, headers=HEADERS)
-        response.raise_for_status()
-        feed = feedparser.parse(response.content)
-        if feed.bozo:
-            logging.warning(f"Feed parsing error for {url}: {feed.bozo_exception}")
-            return None
-        logging.info(f"Successfully fetched and parsed feed: {url}")
-        return feed
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"Failed to fetch or parse RSS feed {url}: {e}")
-        return None
-
-def fetch_feed_with_retries(url, timeout=15, retries=3, delay=5):
-    for attempt in range(1, retries + 1):
-        logging.info(f"Attempt {attempt} to fetch feed: {url}")
-        feed = fetch_feed(url, timeout=timeout)
-        if feed is not None:
-            return feed
-        logging.warning(f"Retrying fetching RSS feed {url} (attempt {attempt}/{retries}) after {delay}s delay")
-        time.sleep(delay)
-    logging.error(f"All {retries} attempts failed to fetch feed: {url}")
-    return None
-
-def scrape_articles():
-    articles = []
-    for source in news_sources:
-        feed = fetch_feed_with_retries(source['rss'])
-        if feed is None:
-            logging.warning(f"Skipping feed {source['name']} due to repeated fetch failures.")
-            continue
-        for entry in feed.entries:
-            articles.append({'title': entry.title, 'link': entry.link, 'source': source['name']})
-        logging.info(f"Added {len(feed.entries)} articles from {source['name']}")
-    logging.info(f"Total articles scraped: {len(articles)}")
-    return articles
-
-def is_valid_image_url(url):
-    try:
-        if not url:
-            return False
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return False
-        Image.open(BytesIO(response.content))
-        return True
-    except Exception:
-        return False
-
-def extract_article_content(articles):
-    logging.info("Starting extract_article_content")
-    for article in articles:
-        try:
-            response = requests.get(article['link'])
-            soup = BeautifulSoup(response.content, 'html.parser')
-            article['content'] = soup.get_text()
-            article['image'] = None
-            for img in soup.find_all('img'):
-                if img.has_attr('src') and is_valid_image_url(img['src']):
-                    article['image'] = img['src']
-                    break
-            if not article['image']:
-                article['image'] = FALLBACK_IMAGE_URL
-        except Exception as e:
-            logging.warning(f"Error scraping {article['link']}: {str(e)}")
-            article['image'] = FALLBACK_IMAGE_URL
-    logging.info("Completed extract_article_content")
-    return articles
-
-def filter_debate_driven(articles):
-    logging.info("Starting filter_debate_driven")
-    debate_articles = []
-    for article in articles:
-        try:
-            sentiment = sia.polarity_scores(article['content'])
-            if sentiment['compound'] > 0.5 or sentiment['compound'] < -0.5:
-                debate_articles.append(article)
-        except Exception as e:
-            logging.warning(f"Sentiment analysis error for article '{article.get('title', '')}': {str(e)}")
-    logging.info(f"Filtered {len(debate_articles)} debate-driven articles")
-    return debate_articles
-
-
-def generate_hashtags(text):
-    keywords = ["BreakingNews", "CurrentAffairs", "WorldNews", "Politics", "Headlines", "GlobalUpdate"]
-    if text:
-        text_keywords = text.lower().split()
-        filtered = [tag for tag in keywords if tag.lower() in text_keywords or tag.lower()[:-4] in text_keywords]
-        tags = filtered[:3] if filtered else random.sample(keywords, k=3)
-    else:
-        tags = random.sample(keywords, k=3)
-    return " ".join(f"#{tag}" for tag in tags)
-
-def truncate_to_graphemes(text, limit):
-    graphemes = regex.findall(r'\X', text)
-    if len(graphemes) > limit:
-        return ''.join(graphemes[:limit]) + "..."
-    return text
-
 
 def post_on_x(article, x_credentials, captions):
     if not all(x_credentials.get(k) for k in ['bearer_token']):
@@ -164,19 +61,28 @@ def post_on_x(article, x_credentials, captions):
         return
 
     try:
-        client = tweepy.Client(bearer_token=x_credentials['bearer_token'],
-                               consumer_key=x_credentials.get('consumer_key'),
-                               consumer_secret=x_credentials.get('consumer_secret'),
-                               access_token=x_credentials.get('access_token'),
-                               access_token_secret=x_credentials.get('access_token_secret'))
+        client = tweepy.Client(
+            bearer_token=x_credentials['bearer_token'],
+            consumer_key=x_credentials.get('consumer_key'),
+            consumer_secret=x_credentials.get('consumer_secret'),
+            access_token=x_credentials.get('access_token'),
+            access_token_secret=x_credentials.get('access_token_secret')
+        )
 
-        hashtags = generate_hashtags(article['title'])
-        status_text = f"{random.choice(captions)}{article['title']}\n{article['link']}\n{hashtags}"
-        if len(status_text) > 280:
-            allowed_length = 280 - len(hashtags) - 2  # for newline and spacing
-            status_text = f"{status_text[:allowed_length]}...\n{hashtags}"
+        hashtags = generate_hashtags(article['title'])  # Returns list like ['#AI', '#News']
+        hashtags_text = ' '.join(hashtags)
+        prefix = random.choice(captions)
+        title = article['title']
+        link = article['link']
 
-        response = client.create_tweet(text=status_text)
+        base_text = f"{prefix}{title}\n{link}\n{hashtags_text}"
+
+        if len(base_text) > 280:
+            max_title_length = 280 - len(prefix) - len(link) - len(hashtags_text) - 4  # extra for \n and "..."
+            title = title[:max_title_length].rstrip() + "..."
+            base_text = f"{prefix}{title}\n{link}\n{hashtags_text}"
+
+        response = client.create_tweet(text=base_text)
         if response.data:
             logging.info(f"Posted to X with tweet ID {response.data['id']}")
         else:
@@ -225,40 +131,41 @@ def post_on_instagram(article):
 def post_on_bluesky(article):
     logging.info("Attempting to post on Bluesky")
     if bluesky_credentials.get('did') and bluesky_credentials.get('password'):
+        client = None
         try:
             client = Client()
             client.login(bluesky_credentials['did'], bluesky_credentials['password'])
 
             hashtags = generate_hashtags(article['title'])
             prefix = random.choice(captions)
-            caption_text = f"{prefix}{article['title']}\n\n{hashtags}"
-            link_text = article['link']
-
+            caption_text = f"{prefix}{article['title']}\n\n{' '.join(hashtags)}"
             full_text = truncate_to_graphemes(caption_text, 300)
 
-            facets = []
+            if not full_text:
+                raise ValueError("full_text could not be generated properly")
 
-            # Fetch and upload image
+            facets = create_facets_from_text(full_text)
+
             image_url = article.get('image', FALLBACK_IMAGE_URL)
-            image_response = requests.get(image_url)
+            image_response = requests.get(image_url, timeout=5)
+            image_response.raise_for_status()
             image_bytes = BytesIO(image_response.content)
             uploaded_blob = client.com.atproto.repo.upload_blob(image_bytes)
 
-            # Create embed (external card with thumbnail)
             embed = {
                 "$type": "app.bsky.embed.external",
                 "external": {
-                    "uri": link_text,
+                    "uri": article.get('link', ''),
                     "title": article.get('title', ''),
                     "description": article.get('description', ''),
-                    "thumb": uploaded_blob.blob  # This is the correct blob object
+                    "thumb": uploaded_blob.blob
                 }
             }
 
             client.send_post(
                 text=full_text,
                 facets=facets,
-                embed=embed  # NO embed_alt — it’s invalid here
+                embed=embed
             )
 
             logging.info("Posted to Bluesky with embedded website card and image thumbnail")
@@ -267,24 +174,6 @@ def post_on_bluesky(article):
     else:
         logging.warning("Bluesky credentials missing. Skipping post.")
 
-
-def paginate(func, key, actor_did):
-    cursor = None
-    all_profiles = []
-    while True:
-        params = {
-            'actor': actor_did,
-            'limit': 100
-        }
-        if cursor:
-            params['cursor'] = cursor
-        response = func(params)  # <--- FIXED: pass entire dict as single argument
-        items = getattr(response, key, [])
-        all_profiles.extend(items)
-        cursor = getattr(response, 'cursor', None)
-        if not cursor:
-            break
-    return all_profiles
 
 def follow_back_bluesky():
     logging.info("Attempting to follow back users on Bluesky")
@@ -396,14 +285,14 @@ def follow_back_x(x_credentials):
 
 def post_articles_and_followback():
     logging.info("Starting post_articles_and_followback")
-    articles = scrape_articles()
+    articles = scrape_articles(news_sources)
     articles = extract_article_content(articles)
     debate_articles = filter_debate_driven(articles)
 
     if debate_articles:
         article = random.choice(debate_articles)
         logging.info(f"Selected article for posting: {article['title']}")
-        # post_on_x(article, x_credentials, captions)
+        post_on_x(article, x_credentials, captions)
         # post_on_facebook(article)
         # post_on_instagram(article)
         post_on_bluesky(article)
