@@ -146,11 +146,19 @@ def post_on_bluesky(article):
 
             facets = create_facets_from_text(full_text)
 
-            image_url = article.get('image', FALLBACK_IMAGE_URL)
-            image_response = requests.get(image_url, timeout=5)
-            image_response.raise_for_status()
-            image_bytes = BytesIO(image_response.content)
-            uploaded_blob = client.com.atproto.repo.upload_blob(image_bytes)
+            try:
+                image_url = article.get('image', FALLBACK_IMAGE_URL)
+                image_response = requests.get(image_url, timeout=5)
+                image_response.raise_for_status()
+                if 'image' not in image_response.headers.get('Content-Type', '') or len(image_response.content) < 2048:
+                    raise ValueError("Invalid or blank image detected")
+                image_bytes = BytesIO(image_response.content)
+                uploaded_blob = client.com.atproto.repo.upload_blob(image_bytes)
+            except Exception as e:
+                logging.warning(f"Using fallback image: {e}")
+                fallback_response = requests.get(FALLBACK_IMAGE_URL, timeout=5)
+                fallback_response.raise_for_status()
+                image_bytes = BytesIO(fallback_response.content)
 
             embed = {
                 "$type": "app.bsky.embed.external",
