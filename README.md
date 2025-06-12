@@ -1,6 +1,6 @@
 # README.md
 
-# News Poster Docker
+# News Poster
 
 This Python module automates the scraping, processing, and social posting of news articles. It extracts articles from RSS feeds, analyzes sentiment, gathers imagery, and publishes to multiple platforms including Twitter, Facebook, Instagram, and Bluesky. It also includes a follow-back system for Bluesky to enhance audience engagement.
 
