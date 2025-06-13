@@ -10,3 +10,5 @@ pytz
 Pillow
 atproto
 regex
+re
+numpy
