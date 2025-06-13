@@ -13,6 +13,10 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from nltk.sentiment import SentimentIntensityAnalyzer
 from news_sources_config import get_all_news_sources
+from collections import Counter
+
+from PIL import Image, UnidentifiedImageError
+import numpy as np
 
 
 # —— Constants —— #
@@ -172,22 +176,32 @@ def truncate_to_graphemes(text, limit):
     return text
 
 
-def generate_hashtags(text, max_tags=5):
+def generate_hashtags(text, max_tags=5, min_len=4):
     """
-    Extract up to `max_tags` meaningful hashtags from text, excluding STOP_WORDS.
-    Returns a list of strings like ['#News', '#AI'].
+    Extract up to `max_tags` meaningful hashtags from text, excluding stopwords.
+    Uses frequency to prioritize words.
+    Returns list of hashtags like ['#News', '#Technology'].
     """
+
+    # Normalize and extract words (letters, digits, hyphens allowed)
     words = re.findall(r"\b[a-zA-Z][\w-]*\b", text.lower())
-    seen = set()
-    tags = []
-    for w in words:
-        if w in STOP_WORDS or len(w) < 3 or w in seen:
-            continue
-        seen.add(w)
-        tags.append(f"#{w.capitalize()}")
-        if len(tags) >= max_tags:
+
+    # Filter out stopwords and short words
+    filtered_words = [w for w in words if w not in STOP_WORDS and len(w) >= min_len]
+
+    # Count frequency
+    word_freq = Counter(filtered_words)
+
+    # Sort by frequency descending, then alphabetically
+    sorted_words = sorted(word_freq.items(), key=lambda x: (-x[1], x[0]))
+
+    hashtags = []
+    for word, _ in sorted_words:
+        hashtags.append(f"#{word.capitalize()}")
+        if len(hashtags) >= max_tags:
             break
-    return tags
+
+    return hashtags
 
 
 def create_facets_from_text(text):
@@ -230,3 +244,4 @@ def paginate(func, key, actor_did, limit=100):
         if not cursor:
             break
     return all_items
+

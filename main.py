@@ -3,6 +3,7 @@ import logging, random, schedule, time, pytz
 from datetime import datetime
 from io import BytesIO
 from news_sources_config import get_all_news_sources
+from images import get_valid_image_blob
 
 from usernames          import (
     x_credentials,
@@ -19,7 +20,6 @@ from utils import (
     truncate_to_graphemes,
     create_facets_from_text,
     paginate,
-    is_valid_image_url,
     FALLBACK_IMAGE_URL,
 )
 
@@ -42,16 +42,16 @@ logging.info(f"Loaded {len(news_sources)} news sources")
 
 captions = [
     "What's your take on this?\n",
-    "Discuss:\n",
-    "Your thoughts?\n",
-    "Share your opinion:\n",
-    "What do you think about this?\n",
-    "Debate:\n",
-    "We want to hear from you:\n",
-    "Your say:\n",
-    "Comment below:\n",
-    "Join the conversation:\n",
-    "What's on your mind?\n"
+    "Discuss:\n\n",
+    "Your thoughts?\n\n",
+    "Share your opinion:\n\n",
+    "What do you think about this?\n\n",
+    "How do you feel about this?\n\n",
+    "We want to hear from you:\n\n",
+    "Have your say:\n\n",
+    "Comment below:\n\n",
+    "Join the conversation:\n\n",
+    "What's on your mind?\n\n"
 ]
 
 
@@ -130,6 +130,7 @@ def post_on_instagram(article):
 
 def post_on_bluesky(article):
     logging.info("Attempting to post on Bluesky")
+
     if bluesky_credentials.get('did') and bluesky_credentials.get('password'):
         client = None
         try:
@@ -146,29 +147,20 @@ def post_on_bluesky(article):
 
             facets = create_facets_from_text(full_text)
 
-            try:
-                image_url = article.get('image', FALLBACK_IMAGE_URL)
-                image_response = requests.get(image_url, timeout=5)
-                image_response.raise_for_status()
-                if 'image' not in image_response.headers.get('Content-Type', '') or len(image_response.content) < 2048:
-                    raise ValueError("Invalid or blank image detected")
-                image_bytes = BytesIO(image_response.content)
-                uploaded_blob = client.com.atproto.repo.upload_blob(image_bytes)
-            except Exception as e:
-                logging.warning(f"Using fallback image: {e}")
-                fallback_response = requests.get(FALLBACK_IMAGE_URL, timeout=5)
-                fallback_response.raise_for_status()
-                image_bytes = BytesIO(fallback_response.content)
+            # Unified image fetching, validation, and upload
+            blob = get_valid_image_blob(article.get('image'), client)
 
-            embed = {
-                "$type": "app.bsky.embed.external",
-                "external": {
-                    "uri": article.get('link', ''),
-                    "title": article.get('title', ''),
-                    "description": article.get('description', ''),
-                    "thumb": uploaded_blob.blob
+            embed = None
+            if blob:
+                embed = {
+                    "$type": "app.bsky.embed.external",
+                    "external": {
+                        "uri": article.get('link', ''),
+                        "title": article.get('title', ''),
+                        "description": article.get('description', ''),
+                        "thumb": blob
+                    }
                 }
-            }
 
             client.send_post(
                 text=full_text,
@@ -177,8 +169,10 @@ def post_on_bluesky(article):
             )
 
             logging.info("Posted to Bluesky with embedded website card and image thumbnail")
+
         except Exception as e:
             logging.error(f"Failed to post on Bluesky: {str(e)}")
+
     else:
         logging.warning("Bluesky credentials missing. Skipping post.")
 
@@ -314,18 +308,29 @@ def job_in_timezone(tz):
     logging.info(f"Running job at {now.isoformat()} in timezone {tz.zone}")
     post_articles_and_followback()
 
+def get_randomized_time(hour):
+    """Return a time string like '07:13' with randomized minutes (1–14)."""
+    minute = random.randint(1, 14)
+    return f"{hour:02d}:{minute:02d}"
+
 def schedule_jobs():
-    logging.info("Scheduling jobs")
+    logging.info("Scheduling jobs with randomized times")
     europe_tz = pytz.timezone('Europe/London')
     us_tz = pytz.timezone('US/Eastern')
 
-    schedule.every().day.at("07:00").do(job_in_timezone, tz=europe_tz)
-    schedule.every().day.at("12:00").do(job_in_timezone, tz=europe_tz)
-    schedule.every().day.at("18:00").do(job_in_timezone, tz=europe_tz)
-    schedule.every().day.at("07:00").do(job_in_timezone, tz=us_tz)
-    schedule.every().day.at("12:00").do(job_in_timezone, tz=us_tz)
-    schedule.every().day.at("18:00").do(job_in_timezone, tz=us_tz)
-    logging.info("Jobs scheduled")
+    # Define desired hours to run
+    hours_to_schedule = [7, 12, 17, 19]
+
+    for hour in hours_to_schedule:
+        eu_time = get_randomized_time(hour)
+        us_time = get_randomized_time(hour)
+
+        schedule.every().day.at(eu_time).do(job_in_timezone, tz=europe_tz)
+        schedule.every().day.at(us_time).do(job_in_timezone, tz=us_tz)
+
+        logging.info(f"Scheduled EU job at {eu_time}, US job at {us_time}")
+
+    logging.info("All jobs scheduled with randomized offsets")
 
 
 if __name__ == '__main__':
