@@ -1,5 +1,6 @@
 # utils.py
 
+import atproto
 import os
 import re
 import regex
@@ -17,6 +18,7 @@ from collections import Counter
 
 from PIL import Image, UnidentifiedImageError
 import numpy as np
+
 
 
 # —— Constants —— #
@@ -93,8 +95,6 @@ def fetch_feed_with_retries(url, timeout=15, retries=3, delay=5):
     return None
 
 
-# —— Article Extraction —— #
-
 def is_valid_image_url(url):
     """Return True if the URL points to a valid image (status 200 & PIL can open)."""
     try:
@@ -107,6 +107,21 @@ def is_valid_image_url(url):
     except Exception:
         return False
 
+
+def get_valid_image_blob(url, client):
+    headers = {"User-Agent": "NewsBot/1.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        img = Image.open(BytesIO(resp.content))
+        blob = client.com.atproto.repo.upload_blob(BytesIO(resp.content))
+        return blob.blob
+    except Exception as e:
+        logging.warning(f"Invalid image {url}: {e}")
+        if url != FALLBACK_IMAGE_URL:
+            return get_valid_image_blob(FALLBACK_IMAGE_URL, client)
+
+# —— Article Extraction —— #
 
 def extract_single_article(article):
     """Fetch the article page, extract text + find a valid image (or fallback)."""
@@ -167,81 +182,89 @@ def filter_debate_driven(articles, threshold=0.5, max_workers=10):
 
 
 # —— Text Utilities —— #
-
 def truncate_to_graphemes(text, limit):
-    """Truncate a string to `limit` Unicode grapheme clusters, adding “...” if cut."""
-    graphemes = regex.findall(r"\X", text)
-    if len(graphemes) > limit:
-        return "".join(graphemes[:limit]) + "..."
-    return text
-
+    chars = regex.findall(r"\X", text)
+    return "".join(chars[:limit]) + ("..." if len(chars) > limit else "")
 
 def generate_hashtags(text, max_tags=5, min_len=4):
-    """
-    Extract up to `max_tags` meaningful hashtags from text, excluding stopwords.
-    Uses frequency to prioritize words.
-    Returns list of hashtags like ['#News', '#Technology'].
-    """
-
-    # Normalize and extract words (letters, digits, hyphens allowed)
     words = re.findall(r"\b[a-zA-Z][\w-]*\b", text.lower())
-
-    # Filter out stopwords and short words
-    filtered_words = [w for w in words if w not in STOP_WORDS and len(w) >= min_len]
-
-    # Count frequency
-    word_freq = Counter(filtered_words)
-
-    # Sort by frequency descending, then alphabetically
-    sorted_words = sorted(word_freq.items(), key=lambda x: (-x[1], x[0]))
-
-    hashtags = []
-    for word, _ in sorted_words:
-        hashtags.append(f"#{word.capitalize()}")
-        if len(hashtags) >= max_tags:
-            break
-
-    return hashtags
+    freq = {}
+    for w in words:
+        if w in STOP_WORDS or len(w) < min_len: continue
+        freq[w] = freq.get(w, 0) + 1
+    tags = sorted(freq.keys(), key=lambda w: (-freq[w], w))[:max_tags]
+    return [f"#{w.capitalize()}" for w in tags]
 
 
 def create_facets_from_text(text):
-    """
-    Convert #hashtags in `text` into Bluesky facet objects so they render as links.
-    Returns a list of facet dicts.
-    """
     facets = []
-    for m in re.finditer(r"#(\w+)", text):
-        tag = m.group(1)
+    for m in re.finditer(r"#([A-Za-z]\w+)", text):
         start, end = m.span()
         facets.append({
             "$type": "app.bsky.richtext.facet",
-            "features": [{
-                "$type": "app.bsky.richtext.facet#tag",
-                "tag": tag
-            }],
+            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": m.group(1)}],
             "index": {"byteStart": start, "byteEnd": end}
         })
     return facets
 
+# def create_facets_from_text(text):
+#     rt = atproto.RichText(text)
+#     rt.detect_facets()
+#     return rt.facets
 
 # —— Pagination Utility —— #
 
-def paginate(func, key, actor_did, limit=100):
-    """
-    Generic paginator for Bluesky graph endpoints.
-    `func(params)` should return an object with attributes `.key` (list) and `.cursor`.
-    """
+def paginate_graph(method, actor_did):
     cursor = None
-    all_items = []
+    items = []
     while True:
-        params = {'actor': actor_did, 'limit': limit}
-        if cursor:
-            params['cursor'] = cursor
-        resp = func(params)
-        items = getattr(resp, key, []) or []
-        all_items.extend(items)
-        cursor = getattr(resp, 'cursor', None)
-        if not cursor:
-            break
-    return all_items
+        response = method({"actor": actor_did, "limit": 100, **({"cursor": cursor} if cursor else {})})
+        batch = getattr(response, "followers", None) or getattr(response, "follows", []) or []
+        items.extend(batch)
+        cursor = getattr(response, "cursor", None)
+        if not cursor: break
+    return items
 
+# —— Followback utility —— #
+
+def simplified_follow_back_bluesky(client, my_did):
+    graph = client.app.bsky.graph
+    actor = client.app.bsky.actor
+
+    # Fetch followers and following
+    followers = graph.get_followers({'actor': my_did}).followers
+    following = graph.get_follows({'actor': my_did}).follows
+    following_dids = {f.did for f in following if hasattr(f, 'did')}
+
+    logging.info(f"Currently following {len(following_dids)} users, checking {len(followers)} followers")
+
+    for follower in followers:
+        try:
+            follower_did = getattr(follower, 'did', None)
+            if not follower_did:
+                continue
+
+            if follower_did in following_dids:
+                continue
+
+            if not getattr(follower, 'avatar', None):
+                logging.info(f"Skipping {follower_did}: No avatar")
+                continue
+
+            profile = actor.get_profile({'actor': follower_did})
+
+            if getattr(profile, 'followersCount', 0) < 10:
+                logging.info(f"Skipping {follower_did}: <10 followers")
+                continue
+            if getattr(profile, 'postsCount', 0) < 5:
+                logging.info(f"Skipping {follower_did}: <5 posts")
+                continue
+            if not getattr(profile, 'lastSeenAt', None):
+                logging.info(f"Skipping {follower_did}: No lastSeenAt")
+                continue
+
+            graph.follow({'subject': follower_did})
+            logging.info(f"✅ Followed back {follower_did}")
+
+        except Exception as e:
+            logging.warning(f"Error processing follower {getattr(follower, 'did', 'unknown')}: {e}")

@@ -13,14 +13,13 @@ from usernames          import (
 )
 from utils import (
     scrape_articles,
-    fetch_feed_with_retries,
     extract_article_content,
     filter_debate_driven,
     generate_hashtags,
     truncate_to_graphemes,
     create_facets_from_text,
-    paginate,
     FALLBACK_IMAGE_URL,
+    simplified_follow_back_bluesky
 )
 
 import tweepy, facebook, instaloader, requests
@@ -94,6 +93,38 @@ def post_on_x(article, x_credentials, captions):
     except Exception as e:
         logging.error(f"Unexpected X posting error: {e}")
 
+def post_on_bluesky(article, captions, bluesky_credentials, fallback_image_url):
+    if not (bluesky_credentials.get("did") and bluesky_credentials.get("password")):
+        logging.warning("Missing Bluesky credentials. Skipping post.")
+        return
+
+    try:
+        client = Client()
+        client.login(bluesky_credentials["did"], bluesky_credentials["password"])
+        logging.info("Logged into Bluesky")
+
+        hashtags = generate_hashtags(article["title"])
+        prefix = random.choice(captions)
+        base_text = f"{prefix}{article['title']}\n\n{' '.join(hashtags)}"
+        text = truncate_to_graphemes(base_text, 300)
+
+        # Properly detect hashtags and attach as facets
+        facets = create_facets_from_text(text)
+
+        embed = {
+            "$type": "app.bsky.embed.external",
+            "external": {
+                "uri": article.get("link", ""),
+                "title": article.get("title", ""),
+                "description": article.get("description", "") or article.get("title", ""),
+                "thumb": get_valid_image_blob(article.get("image") or fallback_image_url, client),
+            }
+        }
+
+        client.send_post(text=text, facets=facets, embed=embed)
+        logging.info("Posted to Bluesky")
+    except Exception as e:
+        logging.error(f"Error posting on Bluesky: {e}")
 
 def post_on_facebook(article):
     logging.info("Attempting to post on Facebook")
@@ -128,55 +159,6 @@ def post_on_instagram(article):
     else:
         logging.warning("Instagram credentials missing. Skipping post.")
 
-def post_on_bluesky(article):
-    logging.info("Attempting to post on Bluesky")
-
-    if bluesky_credentials.get('did') and bluesky_credentials.get('password'):
-        client = None
-        try:
-            client = Client()
-            client.login(bluesky_credentials['did'], bluesky_credentials['password'])
-
-            hashtags = generate_hashtags(article['title'])
-            prefix = random.choice(captions)
-            caption_text = f"{prefix}{article['title']}\n\n{' '.join(hashtags)}"
-            full_text = truncate_to_graphemes(caption_text, 300)
-
-            if not full_text:
-                raise ValueError("full_text could not be generated properly")
-
-            facets = create_facets_from_text(full_text)
-
-            # Unified image fetching, validation, and upload
-            blob = get_valid_image_blob(article.get('image'), client)
-
-            embed = None
-            if blob:
-                embed = {
-                    "$type": "app.bsky.embed.external",
-                    "external": {
-                        "uri": article.get('link', ''),
-                        "title": article.get('title', ''),
-                        "description": article.get('description', ''),
-                        "thumb": blob
-                    }
-                }
-
-            client.send_post(
-                text=full_text,
-                facets=facets,
-                embed=embed
-            )
-
-            logging.info("Posted to Bluesky with embedded website card and image thumbnail")
-
-        except Exception as e:
-            logging.error(f"Failed to post on Bluesky: {str(e)}")
-
-    else:
-        logging.warning("Bluesky credentials missing. Skipping post.")
-
-
 def follow_back_bluesky():
     logging.info("Attempting to follow back users on Bluesky")
 
@@ -184,68 +166,10 @@ def follow_back_bluesky():
         try:
             client = Client()
             client.login(bluesky_credentials['did'], bluesky_credentials['password'])
-
-            me = client.me
-            my_did = me.did
+            my_did = client.me.did
             logging.info(f"Authenticated as DID: {my_did}")
 
-            def paginate(method, key, actor_did):
-                cursor = None
-                all_items = []
-                while True:
-                    params = {'actor': actor_did, 'limit': 100}
-                    if cursor:
-                        params['cursor'] = cursor
-                    response = method(params)
-                    items = getattr(response, key, []) or []
-                    logging.info(f"Fetched {len(items)} items from {key}")
-                    all_items.extend(items)
-                    cursor = getattr(response, 'cursor', None)
-                    if not cursor:
-                        break
-                return all_items
-
-            graph_api = client.app.bsky.graph
-
-            followers = paginate(graph_api.get_followers, 'followers', my_did)
-            following = paginate(graph_api.get_follows, 'follows', my_did)
-
-            following_dids = {f.did for f in following if hasattr(f, 'did')}
-            logging.info(f"Currently following {len(following_dids)} users")
-
-            for follower in followers:
-                try:
-                    follower_did = follower.did
-                    logging.info(f"Evaluating follower: {follower_did}")
-
-                    if follower_did in following_dids:
-                        logging.info(f"Already following {follower_did}, skipping")
-                        continue
-
-                    if not getattr(follower, 'avatar', None):
-                        logging.info(f"Follower {follower_did} has no avatar, skipping")
-                        continue
-
-                    profile_response = client.app.bsky.actor.get_profile({'actor': follower_did})
-                    profile = profile_response
-
-                    logging.info(f"Follower {follower_did} profile: followers={getattr(profile, 'followersCount', 0)}, posts={getattr(profile, 'postsCount', 0)}")
-
-                    if getattr(profile, 'followersCount', 0) < 10:
-                        logging.info(f"Follower {follower_did} has less than 10 followers, skipping")
-                        continue
-                    if getattr(profile, 'postsCount', 0) < 5:
-                        logging.info(f"Follower {follower_did} has less than 5 posts, skipping")
-                        continue
-                    if not getattr(profile, 'lastSeenAt', None):
-                        logging.info(f"Follower {follower_did} has no lastSeenAt, skipping")
-                        continue
-
-                    response = graph_api.follow({'subject': follower_did})
-                    logging.info(f"Successfully followed back user: {follower_did}, Response: {response}")
-
-                except Exception as inner_e:
-                    logging.warning(f"Error on follower {getattr(follower, 'did', 'unknown')}: {inner_e}")
+            simplified_follow_back_bluesky(client, my_did)
 
         except Exception as e:
             logging.error(f"Failed to follow back on Bluesky: {str(e)}")
@@ -297,7 +221,7 @@ def post_articles_and_followback():
         post_on_x(article, x_credentials, captions)
         # post_on_facebook(article)
         # post_on_instagram(article)
-        post_on_bluesky(article)
+        post_on_bluesky(article, captions, bluesky_credentials, FALLBACK_IMAGE_URL)
         follow_back_x(x_credentials)
         follow_back_bluesky()
     else:
